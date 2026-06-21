@@ -1,0 +1,15 @@
+[
+  {
+    "id": "patrol-217",
+    "started_at": "02:03",
+    "ended_at": "02:26",
+    "route": ["control-room", "block-c", "storage-c", "gate-3", "control-room"],
+    "observations": [
+      "No person detected inside Storage Yard C.",
+      "Vehicle track visible near east edge of Storage Yard C.",
+      "Gate 3 fence line intact on visual pass.",
+      "Thermal confidence reduced by reflective sheet stacks."
+    ],
+    "coverage_quality": "medium"
+  }
+]

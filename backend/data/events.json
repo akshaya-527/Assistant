@@ -1,0 +1,102 @@
+[
+  {
+    "id": "evt-001",
+    "timestamp": "00:42",
+    "type": "weather",
+    "location_id": "gate-3",
+    "severity": "info",
+    "description": "Wind gusts recorded near the northwest perimeter.",
+    "actor": "weather-station",
+    "confidence": 0.91
+  },
+  {
+    "id": "evt-002",
+    "timestamp": "01:15",
+    "type": "fence_alert",
+    "location_id": "gate-3",
+    "severity": "warning",
+    "description": "Fence vibration alert triggered near Gate 3.",
+    "actor": "perimeter-sensor",
+    "confidence": 0.78
+  },
+  {
+    "id": "evt-003",
+    "timestamp": "01:22",
+    "type": "vehicle_detection",
+    "location_id": "storage-c",
+    "severity": "critical",
+    "description": "Unscheduled vehicle path detected along the edge of Storage Yard C.",
+    "actor": "yard-camera",
+    "confidence": 0.84
+  },
+  {
+    "id": "evt-004",
+    "timestamp": "01:25",
+    "type": "badge_failure",
+    "location_id": "access-a",
+    "severity": "warning",
+    "description": "Failed badge swipe at Access Point A.",
+    "actor": "badge-reader",
+    "confidence": 0.97
+  },
+  {
+    "id": "evt-005",
+    "timestamp": "01:27",
+    "type": "badge_failure",
+    "location_id": "access-a",
+    "severity": "warning",
+    "description": "Second failed badge swipe at Access Point A.",
+    "actor": "badge-reader",
+    "confidence": 0.97
+  },
+  {
+    "id": "evt-006",
+    "timestamp": "01:30",
+    "type": "badge_failure",
+    "location_id": "access-a",
+    "severity": "warning",
+    "description": "Third failed badge swipe at Access Point A.",
+    "actor": "badge-reader",
+    "confidence": 0.97
+  },
+  {
+    "id": "evt-007",
+    "timestamp": "02:05",
+    "type": "drone_patrol",
+    "location_id": "block-c",
+    "severity": "info",
+    "description": "Scheduled drone patrol crossed Block C and the Storage Yard C perimeter.",
+    "actor": "drone-ridge-2",
+    "confidence": 0.88
+  },
+  {
+    "id": "evt-008",
+    "timestamp": "02:18",
+    "type": "thermal_clear",
+    "location_id": "storage-c",
+    "severity": "info",
+    "description": "Drone thermal pass found no stationary heat signature inside Storage Yard C.",
+    "actor": "drone-ridge-2",
+    "confidence": 0.73
+  },
+  {
+    "id": "evt-009",
+    "timestamp": "03:41",
+    "type": "door_contact",
+    "location_id": "warehouse-2",
+    "severity": "info",
+    "description": "Warehouse 2 service door opened during scheduled cleaning window.",
+    "actor": "door-sensor",
+    "confidence": 0.89
+  },
+  {
+    "id": "evt-010",
+    "timestamp": "04:35",
+    "type": "contractor_checkin",
+    "location_id": "south-yard",
+    "severity": "info",
+    "description": "Contractor crew checked in at South Yard staging area.",
+    "actor": "contractor-kiosk",
+    "confidence": 0.95
+  }
+]

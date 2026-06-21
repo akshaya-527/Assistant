@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.pnpm-store/
+.agents/
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.db
+.env
+backend/data/reviews.json

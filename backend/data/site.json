@@ -1,0 +1,87 @@
+{
+  "locations": [
+    {
+      "id": "gate-3",
+      "name": "Gate 3",
+      "x": 14,
+      "y": 34,
+      "type": "perimeter_gate",
+      "risk_weight": 3,
+      "notes": "Northwest perimeter access. Wind gusts can cause occasional fence alerts."
+    },
+    {
+      "id": "access-a",
+      "name": "Access Point A",
+      "x": 36,
+      "y": 46,
+      "type": "controlled_access",
+      "risk_weight": 4,
+      "notes": "Badge-controlled entry into Block C corridor."
+    },
+    {
+      "id": "storage-c",
+      "name": "Storage Yard C",
+      "x": 63,
+      "y": 48,
+      "type": "restricted_storage",
+      "risk_weight": 5,
+      "notes": "Restricted yard for high-value materials. Mentioned in Raghav's note."
+    },
+    {
+      "id": "block-c",
+      "name": "Block C",
+      "x": 52,
+      "y": 35,
+      "type": "work_zone",
+      "risk_weight": 4,
+      "notes": "Active maintenance area near Storage Yard C."
+    },
+    {
+      "id": "warehouse-2",
+      "name": "Warehouse 2",
+      "x": 77,
+      "y": 27,
+      "type": "warehouse",
+      "risk_weight": 2,
+      "notes": "Low overnight activity expected."
+    },
+    {
+      "id": "control-room",
+      "name": "Control Room",
+      "x": 28,
+      "y": 74,
+      "type": "operations",
+      "risk_weight": 1,
+      "notes": "Ops room and drone dock."
+    },
+    {
+      "id": "south-yard",
+      "name": "South Yard",
+      "x": 68,
+      "y": 76,
+      "type": "yard",
+      "risk_weight": 2,
+      "notes": "Contractor staging area."
+    }
+  ],
+  "zones": [
+    {
+      "id": "restricted-zone-c",
+      "name": "Restricted Storage Envelope",
+      "points": [[55, 39], [74, 39], [76, 58], [57, 63], [50, 53]],
+      "risk": "high"
+    },
+    {
+      "id": "perimeter-northwest",
+      "name": "Northwest Perimeter",
+      "points": [[5, 18], [24, 21], [23, 48], [8, 51]],
+      "risk": "medium"
+    },
+    {
+      "id": "ops-zone",
+      "name": "Operations Zone",
+      "points": [[18, 65], [39, 65], [42, 83], [20, 87]],
+      "risk": "low"
+    }
+  ]
+}
