@@ -70,6 +70,19 @@ python app.py
 
 Backend runs on `http://localhost:8000`.
 
+### Render Backend
+
+Set the Render root directory to `backend`.
+
+- Python version: `3.12.8` (pinned in `backend/.python-version`)
+- Build command: `pip install -r requirements.txt`
+- Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+
+If Render still selects Python 3.14, add the environment variable
+`PYTHON_VERSION=3.12.8`, clear the build cache, and redeploy. Python 3.14
+can force the pinned `pydantic-core` package to compile from Rust source
+instead of installing a wheel.
+
 ### Frontend
 
 ```bash
