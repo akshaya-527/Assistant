@@ -71,6 +71,12 @@ npm install
 npm run dev
 ```
 
+## Troubleshooting
+
+If `Investigate Night` shows a temporary `Failed to fetch` or Gemini availability
+error, wait a few minutes and click `Investigate Night` once again. Avoid repeated
+clicks because one investigation can make multiple Gemini requests.
+
 ## Demo Flow
 
 1. Open the app as Maya at 6:10 AM.
@@ -80,6 +86,7 @@ npm run dev
 5. Clear noise, confirm action, or dispute each finding and add Maya's context.
 6. Refine, approve, or reject the briefing.
 7. Use the morning briefing handoff for leadership.
+
 
 ## Future Improvements
 
