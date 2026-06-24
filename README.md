@@ -2,16 +2,6 @@
 
 AI-first overnight intelligence platform for Ridgeway Site. The app helps Maya move from noisy night logs to a trusted morning briefing with evidence, map context, drone follow-up simulation, and human review.
 
-## Submission Resources
-
-- [SUBMISSION_GUIDE.md](SUBMISSION_GUIDE.md): detailed design answers, demo script, tradeoffs, and interviewer Q&A
-- [WRITTEN_RESPONSES.md](WRITTEN_RESPONSES.md): concise submission-ready answers
-- [FINAL_DEMO_SCRIPT.md](FINAL_DEMO_SCRIPT.md): 5-8 minute word-for-word video script
-- [DEPLOYMENT.md](DEPLOYMENT.md): frontend/backend deployment, secrets, CORS, SQLite persistence, and cleanup
-- [ARCHITECTURE.md](ARCHITECTURE.md): current system design
-- [SCALING.md](SCALING.md): large-log and PostgreSQL roadmap
-- [DEMO_SCRIPT.md](DEMO_SCRIPT.md): short demo outline
-
 ## What This MVP Demonstrates
 
 - AI-first investigation before Maya manually reads logs
