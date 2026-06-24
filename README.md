@@ -34,6 +34,8 @@ Gemini proposes contextual tool use and generates structured findings from the c
 - **Custom spatial plan:** A calibrated site plan was chosen instead of map tiles because Ridgeway is a private facility, the workflow must work without a map API key, and all zones, events, and drone routes share one coordinate system.
 - **Human authority:** The system proposes classifications and missions but does not autonomously dispatch security or accuse a person. Maya can clear, confirm, dispute, refine, or approve every finding.
 
+## Setup Instructions
+
 Add Gemini API key here
 
 ```bash
