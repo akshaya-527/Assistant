@@ -64,6 +64,7 @@ class Finding(BaseModel):
     evidence_event_ids: list[str] = Field(default_factory=list)
     location_ids: list[str] = Field(default_factory=list)
     uncertainty: str
+    recommended_action: str
     supports_escalation: list[str] = Field(default_factory=list)
     supports_false_alarm: list[str] = Field(default_factory=list)
 

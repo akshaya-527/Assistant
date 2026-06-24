@@ -8,9 +8,9 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from agent import build_investigation, run_investigation_stream
+from agent import AgentUnavailable, build_investigation, run_investigation_stream
 from db import finding_review_drafts, init_db, rows, save_finding_review, save_review
 from models import FindingReview, ReviewRequest
 from tools import call_tool, list_tools
@@ -23,7 +23,10 @@ allowed_origins = [
     origin.strip()
     for origin in os.getenv(
         "ALLOWED_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
+        (
+            "http://localhost:5173,http://127.0.0.1:5173,"
+            "http://localhost:5176,http://127.0.0.1:5176"
+        ),
     ).split(",")
     if origin.strip()
 ]
@@ -35,6 +38,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(AgentUnavailable)
+async def agent_unavailable_handler(_request: Any, exc: AgentUnavailable) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": str(exc), "retryable": True},
+    )
 
 
 @app.on_event("startup")
@@ -112,9 +123,13 @@ async def run_investigation(payload: dict[str, str] | None = None) -> Any:
 @app.get("/api/investigate/stream")
 async def stream_investigation(review_note: str = "") -> StreamingResponse:
     async def event_stream():
-        async for event in run_investigation_stream(review_note=review_note or None):
-            yield f"event: {event['type']}\n"
-            yield f"data: {json.dumps(event['data'])}\n\n"
+        try:
+            async for event in run_investigation_stream(review_note=review_note or None):
+                yield f"event: {event['type']}\n"
+                yield f"data: {json.dumps(event['data'])}\n\n"
+        except AgentUnavailable as exc:
+            yield "event: error\n"
+            yield f"data: {json.dumps({'message': str(exc), 'retryable': True})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

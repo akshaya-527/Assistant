@@ -193,14 +193,30 @@ def calculate_risk(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def plan_follow_up_mission(arguments: dict[str, Any]) -> dict[str, Any]:
-    focus_locations = arguments.get("focus_locations") or ["storage-c", "access-a", "gate-3"]
+    requested = arguments.get("focus_locations") or []
+    focus_locations = list(dict.fromkeys(location for location in requested if location != "control-room"))
+    location_rows = rows("select id, name, risk_weight from locations")
+    locations = {location["id"]: location for location in location_rows}
+    focus_locations = [location for location in focus_locations if location in locations]
+    if not focus_locations:
+        return {
+            "title": "No follow-up mission required",
+            "reason": "The current findings do not contain unresolved locations.",
+            "route": ["control-room"],
+            "eta_minutes": 0,
+            "priority": "low",
+        }
+
+    names = [locations[location]["name"] for location in focus_locations]
+    highest_weight = max(locations[location]["risk_weight"] for location in focus_locations)
+    priority = "high" if highest_weight >= 4 else "medium"
     route = ["control-room", *focus_locations, "control-room"]
     return {
-        "title": "Block C verification sweep",
-        "reason": "Close remaining uncertainty around Storage Yard C, Access Point A, and Gate 3.",
+        "title": "Follow-up verification sweep",
+        "reason": f"Close remaining uncertainty around {', '.join(names)}.",
         "route": route,
-        "eta_minutes": 18,
-        "priority": "high" if "storage-c" in focus_locations else "medium",
+        "eta_minutes": 6 + (4 * len(focus_locations)),
+        "priority": priority,
     }
 
 

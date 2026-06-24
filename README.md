@@ -29,22 +29,20 @@ AI-first overnight intelligence platform for Ridgeway Site. The app helps Maya m
 - Frontend: React, Vite, TypeScript, CSS
 - Data: SQLite seeded from JSON files
 - Tool interface: MCP-style tool registry exposed through `/api/tools`
-- Agent: Gemini-first guarded Planner + ReAct loop with deterministic fallback
+- Agent: Gemini planner and evidence-driven finding generator with strict validation
 
-The app works without an LLM key using the deterministic fallback agent. With a Gemini API key, Gemini proposes the tool plan and synthesizes the briefing while the backend validates tool names, arguments, and outputs. Remote LLM calls use a short timeout so the demo falls back quickly when Gemini is unavailable.
+Gemini proposes contextual tool use and generates structured findings from the current tool evidence. The backend derives candidate groups, risk, confidence, coverage gaps, evidence IDs, and follow-up locations from current data, then validates every model citation. When Gemini is unavailable, the API retries transient failures within a bounded cost budget and returns a visible retryable error; it does not silently present predetermined conclusions.
 
-## Current Data Capacity
+## Design Decisions and Tradeoffs
 
-This is an assignment MVP, not a benchmarked production ingestion service.
-
-- SQLite stores events, locations, patrols, and human reviews across sessions.
-- The current event search reads event rows and filters them in Python.
-- The seeded demo has 10 events. Low thousands of rows should remain comfortable for a local demo, but no production throughput claim is made.
-- Tens or hundreds of thousands of logs should move filtering into indexed SQL and should not be sent directly to the LLM.
-
-See [SCALING.md](SCALING.md) for the proposed PostgreSQL, batching, correlation, and hierarchical summarization design.
-
-## Run Locally
+- **No conclusion fallback:** The system does not manufacture findings when Gemini is unavailable. It returns a clear retryable error after the retry budget is exhausted.
+- **Dynamic findings:** Only simulated input data and safety policies are fixed. Candidate groups, classifications, evidence references, confidence, coverage gaps, briefing text, and follow-up routes emerge from current tool results and validated Gemini output.
+- **SQLite:** Chosen for zero setup, local persistence, and easy inspection in a single-user prototype. Assumptions were low concurrency and one backend instance. PostgreSQL is the production choice for concurrent replicas, durable cloud storage, indexing, and backups.
+- **Timeout and retries:** Gemini calls use bounded exponential backoff with jitter for timeouts, rate limits, and transient server errors, respect Retry-After, and avoid retrying non-retryable client failures. Attempt count, timeout, and backoff are configurable environment variables.
+- **MCP-style tooling:** Tools have discoverable names, descriptions, input schemas, validation, and structured results. This meets the assignment's MCP-style requirement but is not a protocol-complete MCP server transport.
+- **Simulated integrations:** Events, weather, badge history, contractor routes, and drone telemetry are seeded or mocked because real hardware and sensor integrations are out of scope. Production adapters can replace handlers without changing the agent/tool contracts.
+- **Custom spatial plan:** A calibrated site plan was chosen instead of map tiles because Ridgeway is a private facility, the workflow must work without a map API key, and all zones, events, and drone routes share one coordinate system.
+- **Human authority:** The system proposes classifications and missions but does not autonomously dispatch security or accuse a person. Maya can clear, confirm, dispute, refine, or approve every finding.
 
 Add Gemini API key here
 
@@ -56,6 +54,11 @@ Or set in `backend\.env`:
 
 ```env
 GEMINI_API_KEY=your_key_here
+GEMINI_MODEL=gemini-2.5-flash-lite
+GEMINI_TIMEOUT_SECONDS=30
+GEMINI_FINDING_TIMEOUT_SECONDS=90
+GEMINI_MAX_ATTEMPTS=2
+GEMINI_RETRY_BASE_SECONDS=2
 ```
 
 ### Backend
@@ -70,19 +73,6 @@ python app.py
 
 Backend runs on `http://localhost:8000`.
 
-### Render Backend
-
-Set the Render root directory to `backend`.
-
-- Python version: `3.12.8` (pinned in `backend/.python-version`)
-- Build command: `pip install -r requirements.txt`
-- Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-
-If Render still selects Python 3.14, add the environment variable
-`PYTHON_VERSION=3.12.8`, clear the build cache, and redeploy. Python 3.14
-can force the pinned `pydantic-core` package to compile from Rust source
-instead of installing a wheel.
-
 ### Frontend
 
 ```bash
@@ -90,8 +80,6 @@ cd frontend
 npm install
 npm run dev
 ```
-
-Frontend runs on `http://localhost:5173`.
 
 ## Demo Flow
 

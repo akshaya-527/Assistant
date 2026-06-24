@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import os
+import random
 from datetime import datetime
 from typing import Any, AsyncGenerator
 
@@ -18,71 +21,27 @@ INVESTIGATION_SYSTEM_PROMPT = """
 You are an overnight incident analyst for Ridgeway Site, an industrial facility that runs 24/7.
 It is 6:10 AM. You are helping Maya prepare the 8:00 AM leadership briefing.
 
-Your job is to investigate overnight signals and separate noise from incidents that need attention.
-Most alerts are false alarms. Your value is distinguishing the two with evidence.
+Your job is to investigate current tool evidence, not to reproduce a known scenario.
+Classify evidence as CLEARED, NEEDS_REVIEW, or ESCALATE.
 
-Noise patterns:
-- Gate 3 fence alerts around 22:00-02:00 often correlate with wind and adjacent sensor sequence.
-- One or two failed badge swipes can be operator error; three or more at one access point within 10 minutes needs review.
-- Storage Yard C vehicle activity can match Tuesday/Thursday contractor routes, but route deviation matters.
-- A late drone pass reduces risk but does not erase a coverage gap.
-
-Escalation triggers:
-- Restricted-zone signal without clear personnel or contractor authorization.
-- Three or more failed badge swipes at the same point within 10 minutes.
-- Vehicle path that deviates from a known contractor route.
-- Drone patrol gap over 40 minutes covering a flagged zone.
-- Raghav's Block C note makes Storage Yard C / Block C priority.
-
-Classify every signal as:
-- CLEARED: explain exactly why it is consistent with noise and cite the evidence.
-- NEEDS_REVIEW: explain what is suspicious, what is missing, and what Maya should physically verify.
-- ESCALATE: state the evidence chain and the action required before 8:00 AM.
-
-Never claim certainty about an intruder; say unknown individual, contractor, or unverified activity.
-Never say definitely harmless; say consistent with a normal pattern based on specific evidence.
-Always state whether the drone coverage gap overlaps the suspicious window.
-Always state what you know, what you do not know, and what Maya should verify.
+Rules:
+- Cite only event IDs and locations present in the supplied evidence.
+- Never claim certainty about an intruder. Use unknown individual, contractor, vehicle, or activity.
+- Never say definitely harmless. Explain which evidence matches a normal pattern.
+- Three or more badge failures at one point within ten minutes requires NEEDS_REVIEW at minimum.
+- State whether later drone coverage closes or leaves an evidence gap.
+- State what is known, unknown, and what Maya should verify.
+- Every input event must be represented in at least one finding.
+- Return JSON only.
 """
 
-DEFAULT_PLAN = [
-    {
-        "thought": "Checking overnight warning and critical signals first, before reading everything manually.",
-        "tool": "search_events",
-        "arguments": {"severities": ["warning", "critical"], "since": "00:00", "until": "06:10"},
-        "rationale": "Find the signals that could matter for Maya's morning briefing.",
-    },
-    {
-        "thought": "Cross-referencing the flagged locations with site risk and zone context.",
-        "tool": "get_site_context",
-        "arguments": {"location_ids": ["gate-3", "access-a", "storage-c", "block-c"]},
-        "rationale": "Understand whether the locations form a spatially meaningful cluster.",
-    },
-    {
-        "thought": "Checking badge history because three Access Point A failures may be more than a tired worker.",
-        "tool": "get_badge_history",
-        "arguments": {"event_ids": ["evt-004", "evt-005", "evt-006"]},
-        "rationale": "Access-control context decides whether the badge failures are noise or signal.",
-    },
-    {
-        "thought": "Checking whether the drone actually covered Storage Yard C after the suspicious sequence.",
-        "tool": "get_drone_patrols",
-        "arguments": {"location_id": "storage-c"},
-        "rationale": "Separate checked evidence from unresolved gaps.",
-    },
-    {
-        "thought": "Scoring risk with false-alarm context and partial drone coverage included.",
-        "tool": "calculate_risk",
-        "arguments": {},
-        "rationale": "Turn the correlated evidence into an escalation recommendation.",
-    },
-    {
-        "thought": "Planning a follow-up sweep only for the unresolved high-value area.",
-        "tool": "plan_follow_up_mission",
-        "arguments": {"focus_locations": ["storage-c", "access-a", "gate-3"]},
-        "rationale": "Give Maya a lightweight action, not another dashboard.",
-    },
-]
+
+class AgentUnavailable(RuntimeError):
+    """Raised when Gemini cannot produce a trustworthy investigation."""
+
+
+class AgentOutputError(AgentUnavailable):
+    """Raised when Gemini output fails structural or evidence validation."""
 
 
 def _minutes(value: str) -> int:
@@ -95,81 +54,187 @@ def _tool(name: str, arguments: dict[str, Any], rationale: str) -> ToolCall:
     return ToolCall(name=name, arguments=arguments, result=result, rationale=rationale)
 
 
-async def _gemini_json(prompt: str, timeout: int = 5) -> dict[str, Any] | None:
+def _safe_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"Gemini returned HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "Gemini request timed out"
+    if isinstance(exc, httpx.TransportError):
+        return "Gemini network request failed"
+    return "Gemini returned an invalid response"
+
+
+async def _gemini_json(
+    prompt: str,
+    purpose: str,
+    timeout: float | None = None,
+) -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return None
+        raise AgentUnavailable(
+            "Gemini is not configured. Add GEMINI_API_KEY and retry the investigation."
+        )
 
-    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    request_timeout = timeout or float(os.getenv("GEMINI_TIMEOUT_SECONDS", "30"))
+    max_attempts = max(1, int(os.getenv("GEMINI_MAX_ATTEMPTS", "2")))
+    base_delay = max(0.1, float(os.getenv("GEMINI_RETRY_BASE_SECONDS", "0.75")))
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"response_mime_type": "application/json"},
+        "generationConfig": {"responseMimeType": "application/json"},
     }
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
+
+    last_error = "unknown Gemini failure"
+    attempts_made = 0
+    for attempt in range(max_attempts):
+        attempts_made = attempt + 1
+        retryable = False
+        try:
+            async with httpx.AsyncClient(timeout=request_timeout) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
             text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
-    except Exception:
-        return None
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise ValueError("Gemini response is not an object")
+            return data
+        except httpx.HTTPStatusError as exc:
+            last_error = _safe_error(exc)
+            retryable = exc.response.status_code == 429 or exc.response.status_code >= 500
+            retry_after = exc.response.headers.get("retry-after")
+            if retry_after:
+                try:
+                    base_delay = max(base_delay, float(retry_after))
+                except ValueError:
+                    pass
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_error = _safe_error(exc)
+            retryable = True
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            last_error = _safe_error(exc)
+            retryable = attempt + 1 < max_attempts
+
+        if not retryable or attempt + 1 >= max_attempts:
+            break
+        delay = (base_delay * (2**attempt)) + random.uniform(0, base_delay / 3)
+        await asyncio.sleep(delay)
+
+    raise AgentUnavailable(
+        f"Gemini could not complete {purpose} after {attempts_made} attempt(s): "
+        f"{last_error}. Retry when the model is available."
+    )
 
 
-async def _plan_with_gemini(review_note: str | None) -> list[dict[str, Any]]:
-    tools = [
-        {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
-        for tool in TOOLS.values()
+async def _plan_with_gemini(
+    events: list[dict[str, Any]],
+    review_note: str | None,
+) -> list[dict[str, Any]]:
+    available = [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.input_schema,
+        }
+        for name, tool in TOOLS.items()
+        if name not in {"search_events", "plan_follow_up_mission"}
+    ]
+    event_digest = [
+        {
+            "id": event["id"],
+            "timestamp": event["timestamp"],
+            "type": event["type"],
+            "location_id": event["location_id"],
+            "severity": event["severity"],
+            "description": event["description"],
+            "context": event.get("context", {}),
+        }
+        for event in events
     ]
     prompt = f"""
 {INVESTIGATION_SYSTEM_PROMPT}
 
-You are the investigation planner for Maya at Ridgeway Site.
-Choose a short ReAct-style tool plan. Return JSON only:
-{{"steps":[{{"thought":"...","tool":"search_events","arguments":{{...}},"rationale":"..."}}]}}
+The mandatory event-search tool has returned:
+{json.dumps(event_digest)}
 
-Rules:
-- Use only these tools: {json.dumps(tools)}
-- Include search_events first.
-- Decide whether badge history, drone patrols, risk scoring, and follow-up mission planning are useful based on the evidence.
-- Use get_badge_history for badge failures before calculate_risk.
-- Do not invent data. The backend will execute tools.
-- Prefer identifying false alarms and uncertainty, not just escalation.
-- Human review note: {review_note or "none"}
+Choose the contextual tools required before classification.
+Available tools:
+{json.dumps(available)}
+
+Return:
+{{"steps":[{{"thought":"auditable reason","tool":"tool_name","arguments":{{}},"rationale":"why this evidence is needed"}}]}}
+
+Evidence policy:
+- Include get_site_context for all observed location IDs.
+- If badge failures exist, include get_badge_history with their event IDs.
+- If warning or critical events exist, include get_drone_patrols.
+- Include calculate_risk after the contextual tools.
+- Use each tool at most once.
+- Do not include search_events or plan_follow_up_mission.
+- Maximum five steps.
+- Maya's note: {review_note or "none"}
 """
-    data = await _gemini_json(prompt)
-    steps = data.get("steps") if data else None
+    data = await _gemini_json(prompt, "tool planning")
+    steps = data.get("steps")
     if not isinstance(steps, list):
-        return DEFAULT_PLAN
+        raise AgentOutputError("Gemini tool plan did not contain a steps array.")
 
-    validated = []
-    for step in steps[:6]:
+    validated: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for step in steps[:5]:
         if not isinstance(step, dict):
-            continue
+            raise AgentOutputError("Gemini tool plan contained a malformed step.")
         name = step.get("tool")
-        args = step.get("arguments") or {}
-        if name not in TOOLS or not isinstance(args, dict):
-            continue
+        arguments = step.get("arguments") or {}
+        if name not in TOOLS or name in {"search_events", "plan_follow_up_mission"}:
+            raise AgentOutputError(f"Gemini selected an unavailable tool: {name}.")
+        if name in used or not isinstance(arguments, dict):
+            raise AgentOutputError("Gemini tool plan contained duplicate or invalid arguments.")
+        used.add(name)
         validated.append(
             {
-                "thought": str(step.get("thought") or f"Using {name}."),
+                "thought": str(step.get("thought") or f"Gathering evidence with {name}."),
                 "tool": name,
-                "arguments": args,
+                "arguments": arguments,
                 "rationale": str(step.get("rationale") or TOOLS[name].description),
             }
         )
-    return validated or DEFAULT_PLAN
+
+    required = {"get_site_context", "calculate_risk"}
+    if any(event["type"] == "badge_failure" for event in events):
+        required.add("get_badge_history")
+    if any(event["severity"] in {"warning", "critical"} for event in events):
+        required.add("get_drone_patrols")
+    missing = required - used
+    if missing:
+        raise AgentOutputError(
+            f"Gemini tool plan omitted required evidence tools: {', '.join(sorted(missing))}."
+        )
+
+    positions = {step["tool"]: index for index, step in enumerate(validated)}
+    risk_position = positions["calculate_risk"]
+    if any(positions[name] > risk_position for name in required - {"calculate_risk"}):
+        raise AgentOutputError("Gemini attempted risk calculation before gathering context.")
+    return validated
 
 
-def _prepare_calculate_args(arguments: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    events = context.get("important_events", [])
+def _prepare_calculate_args(
+    arguments: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    events = context.get("events", [])
     locations = context.get("site_context", {}).get("locations", [])
     patrols = context.get("drone_context", {}).get("patrols", [])
     badge_history = context.get("badge_context", {}).get("badge_histories", [])
     return {
         **arguments,
         "events": events,
-        "location_weights": {location["id"]: location["risk_weight"] for location in locations},
+        "location_weights": {
+            location["id"]: location["risk_weight"] for location in locations
+        },
         "drone_coverage": patrols[0]["coverage_quality"] if patrols else "low",
         "badge_history": badge_history,
     }
@@ -177,45 +242,398 @@ def _prepare_calculate_args(arguments: dict[str, Any], context: dict[str, Any]) 
 
 def _summarize_observation(tool: ToolCall) -> str:
     if tool.name == "search_events":
-        count = tool.result["count"]
-        return f"Found {count} warning/critical signals for review."
+        return f"Found {tool.result['count']} overnight signals across all severities."
     if tool.name == "get_site_context":
-        names = ", ".join(location["name"] for location in tool.result["locations"])
-        return f"Mapped the cluster around {names}."
+        return f"Loaded spatial context for {len(tool.result['locations'])} locations."
     if tool.name == "get_drone_patrols":
-        patrols = tool.result["patrols"]
-        if not patrols:
-            return "No drone coverage found for the selected area."
-        return f"Drone coverage exists but quality is {patrols[0]['coverage_quality']}."
+        return f"Found {tool.result['count']} relevant drone patrol record(s)."
     if tool.name == "get_badge_history":
-        histories = tool.result["badge_histories"]
-        if not histories:
-            return "No badge identity context found for the access failures."
-        return f"Badge context found: {histories[0]['badge_id']} had {histories[0]['failures_at_access_a_within_10min']} Access Point A failures."
+        return f"Found {tool.result['count']} badge-history record(s)."
     if tool.name == "calculate_risk":
-        return f"Risk score {tool.result['score']} with {tool.result['confidence']}% confidence."
-    if tool.name == "plan_follow_up_mission":
-        return f"Proposed {tool.result['title']} in {tool.result['eta_minutes']} minutes."
-    return "Tool result captured."
+        return (
+            f"Evidence risk score is {tool.result['score']} with "
+            f"{tool.result['confidence']}% evidence confidence."
+        )
+    return "Structured evidence captured."
 
 
-async def _synthesize_with_gemini(base: dict[str, Any], review_note: str | None) -> dict[str, Any] | None:
+def _distance(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return math.hypot(float(a["x"]) - float(b["x"]), float(a["y"]) - float(b["y"]))
+
+
+def _events_related(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    locations: dict[str, dict[str, Any]],
+) -> bool:
+    delta = abs(_minutes(left["timestamp"]) - _minutes(right["timestamp"]))
+    if left["location_id"] == right["location_id"] and delta <= 75:
+        return True
+    left_location = locations.get(left["location_id"])
+    right_location = locations.get(right["location_id"])
+    spatially_close = bool(
+        left_location
+        and right_location
+        and _distance(left_location, right_location) <= 35
+    )
+    meaningful_signal = (
+        left["severity"] in {"warning", "critical"}
+        or right["severity"] in {"warning", "critical"}
+    )
+    return delta <= 20 and spatially_close and meaningful_signal
+
+
+def _coverage_gap_for_events(
+    events: list[dict[str, Any]],
+    patrols: list[dict[str, Any]],
+    locations: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidates = [
+        event
+        for event in events
+        if event["severity"] in {"warning", "critical"}
+        and not event.get("is_false_alarm")
+        and event["type"] not in {"drone_patrol", "thermal_clear"}
+    ]
+    if not candidates:
+        return None
+    severity_rank = {"warning": 1, "critical": 2}
+    event = max(
+        candidates,
+        key=lambda item: (
+            severity_rank[item["severity"]],
+            locations.get(item["location_id"], {}).get("risk_weight", 1),
+            -_minutes(item["timestamp"]),
+        ),
+    )
+    event_time = _minutes(event["timestamp"])
+    later_patrols = [
+        patrol
+        for patrol in patrols
+        if event["location_id"] in patrol["route"]
+        and _minutes(patrol["started_at"]) >= event_time
+    ]
+    if later_patrols:
+        patrol = min(later_patrols, key=lambda item: _minutes(item["started_at"]))
+        end = patrol["started_at"]
+        label = "Unverified window before drone arrival"
+    else:
+        end = "06:10"
+        label = "No later drone coverage before morning review"
+    return {
+        "location_id": event["location_id"],
+        "start": event["timestamp"],
+        "end": end,
+        "minutes": max(0, _minutes(end) - event_time),
+        "label": label,
+    }
+
+
+def _evidence_confidence(
+    events: list[dict[str, Any]],
+    coverage_gap: dict[str, Any] | None,
+) -> int:
+    if not events:
+        return 0
+    base = sum(float(event.get("confidence", 0.5)) for event in events) / len(events)
+    sources = len({event.get("actor") for event in events if event.get("actor")})
+    corroboration_bonus = min(0.1, max(0, sources - 1) * 0.025)
+    gap_penalty = 0.08 if coverage_gap and coverage_gap["minutes"] > 30 else 0
+    return round(max(0.25, min(0.95, base + corroboration_bonus - gap_penalty)) * 100)
+
+
+def build_incident_candidates(
+    events: list[dict[str, Any]],
+    site_context: dict[str, Any],
+    drone_context: dict[str, Any],
+    badge_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    locations = {
+        location["id"]: location for location in site_context.get("locations", [])
+    }
+    patrols = drone_context.get("patrols", [])
+    parents = list(range(len(events)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    for left in range(len(events)):
+        for right in range(left + 1, len(events)):
+            if _events_related(events[left], events[right], locations):
+                union(left, right)
+
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for index, event in enumerate(events):
+        groups.setdefault(find(index), []).append(event)
+
+    candidates: list[dict[str, Any]] = []
+    all_badge_history = badge_context.get("badge_histories", [])
+    location_weights = {
+        location_id: location.get("risk_weight", 1)
+        for location_id, location in locations.items()
+    }
+    for grouped_events in groups.values():
+        grouped_events = sorted(grouped_events, key=lambda event: event["timestamp"])
+        location_ids = list(
+            dict.fromkeys(event["location_id"] for event in grouped_events)
+        )
+        relevant_patrols = [
+            patrol
+            for patrol in patrols
+            if any(location_id in patrol["route"] for location_id in location_ids)
+        ]
+        badge_failures = [
+            event for event in grouped_events if event["type"] == "badge_failure"
+        ]
+        relevant_badges = all_badge_history if len(badge_failures) >= 3 else []
+        gap = _coverage_gap_for_events(grouped_events, relevant_patrols, locations)
+        risk = call_tool(
+            "calculate_risk",
+            {
+                "events": grouped_events,
+                "location_weights": location_weights,
+                "drone_coverage": (
+                    relevant_patrols[0]["coverage_quality"]
+                    if relevant_patrols
+                    else "low"
+                ),
+                "badge_history": relevant_badges,
+            },
+        )
+        event_ids = [event["id"] for event in grouped_events]
+        candidate_id = "candidate-" + hashlib.sha1(
+            "|".join(sorted(event_ids)).encode("utf-8")
+        ).hexdigest()[:10]
+        candidates.append(
+            {
+                "id": candidate_id,
+                "events": grouped_events,
+                "location_ids": location_ids,
+                "locations": [
+                    locations[location_id]
+                    for location_id in location_ids
+                    if location_id in locations
+                ],
+                "badge_history": relevant_badges,
+                "drone_patrols": relevant_patrols,
+                "coverage_gap": gap,
+                "risk": risk,
+                "evidence_confidence": _evidence_confidence(grouped_events, gap),
+            }
+        )
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            -candidate["risk"]["score"],
+            candidate["events"][0]["timestamp"],
+        ),
+    )
+
+
+def _string_list(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise AgentOutputError(f"Gemini finding field {field} must be a string array.")
+    return [item.strip() for item in value]
+
+
+def _replace_unsafe_terms(value: str) -> str:
+    return value.replace("intruder", "unknown individual").replace(
+        "Intruder", "Unknown individual"
+    )
+
+
+def _confidence_for_finding(
+    evidence_events: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> int:
+    evidence_ids = {event["id"] for event in evidence_events}
+    related = max(
+        candidates,
+        key=lambda candidate: len(
+            evidence_ids & {event["id"] for event in candidate["events"]}
+        ),
+    )
+    gap = related.get("coverage_gap")
+    return _evidence_confidence(evidence_events, gap)
+
+
+def validate_generated_investigation(
+    raw: dict[str, Any],
+    events: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    review_map: dict[str, dict[str, Any]],
+) -> tuple[list[Finding], str, str, list[str]]:
+    raw_findings = raw.get("findings")
+    if not isinstance(raw_findings, list):
+        raise AgentOutputError("Gemini investigation did not contain findings.")
+    if events and not raw_findings:
+        raise AgentOutputError("Gemini returned no findings for non-empty evidence.")
+
+    events_by_id = {event["id"]: event for event in events}
+    allowed_ids = set(events_by_id)
+    covered_ids: set[str] = set()
+    findings: list[Finding] = []
+    severity_for = {
+        "CLEARED": "info",
+        "NEEDS_REVIEW": "warning",
+        "ESCALATE": "critical",
+    }
+
+    for index, item in enumerate(raw_findings):
+        if not isinstance(item, dict):
+            raise AgentOutputError("Gemini returned a malformed finding.")
+        classification = item.get("classification")
+        if classification not in severity_for:
+            raise AgentOutputError("Gemini returned an invalid classification.")
+        evidence_ids = _string_list(item.get("evidence_event_ids"), "evidence_event_ids")
+        if not evidence_ids or not set(evidence_ids) <= allowed_ids:
+            raise AgentOutputError("Gemini cited missing or invented event evidence.")
+        covered_ids.update(evidence_ids)
+        evidence_events = [events_by_id[event_id] for event_id in evidence_ids]
+        location_ids = list(
+            dict.fromkeys(event["location_id"] for event in evidence_events)
+        )
+        finding_id = "f-" + hashlib.sha1(
+            ("|".join(sorted(evidence_ids)) + f"|{index}").encode("utf-8")
+        ).hexdigest()[:10]
+        title = _replace_unsafe_terms(str(item.get("title") or "").strip())
+        summary = _replace_unsafe_terms(str(item.get("summary") or "").strip())
+        uncertainty = _replace_unsafe_terms(
+            str(item.get("uncertainty") or "").strip()
+        )
+        action = _replace_unsafe_terms(
+            str(item.get("recommended_action") or "").strip()
+        )
+        if not all([title, summary, uncertainty, action]):
+            raise AgentOutputError("Gemini omitted required finding text.")
+        findings.append(
+            Finding(
+                id=finding_id,
+                title=title,
+                classification=classification,
+                severity=severity_for[classification],
+                confidence=_confidence_for_finding(
+                    evidence_events,
+                    candidates,
+                ),
+                review_status=review_map.get(finding_id, {}).get("status", "pending"),
+                summary=summary,
+                evidence_event_ids=evidence_ids,
+                location_ids=location_ids,
+                uncertainty=uncertainty,
+                recommended_action=action,
+                supports_escalation=_string_list(
+                    item.get("supports_escalation", []),
+                    "supports_escalation",
+                ),
+                supports_false_alarm=_string_list(
+                    item.get("supports_false_alarm", []),
+                    "supports_false_alarm",
+                ),
+            )
+        )
+
+    missing = allowed_ids - covered_ids
+    if missing:
+        raise AgentOutputError(
+            f"Gemini omitted event evidence: {', '.join(sorted(missing))}."
+        )
+    headline = _replace_unsafe_terms(str(raw.get("headline") or "").strip())
+    summary = _replace_unsafe_terms(str(raw.get("summary") or "").strip())
+    if not headline or not summary:
+        raise AgentOutputError("Gemini omitted the briefing headline or summary.")
+    open_questions = _string_list(raw.get("open_questions", []), "open_questions")
+    return findings, headline, summary, open_questions
+
+
+async def _generate_investigation_with_gemini(
+    candidates: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    review_note: str | None,
+) -> dict[str, Any]:
     prompt = f"""
 {INVESTIGATION_SYSTEM_PROMPT}
 
-You are Maya's assistant. Use only this structured evidence to produce final JSON.
-Do not invent facts. Explicitly separate false alarms, unknowns, and escalation.
+Current incident candidates generated from tool evidence:
+{json.dumps(candidates)}
 
-Evidence:
-{json.dumps(base)}
-
-Human review note:
+Maya's context:
 {review_note or "none"}
 
-Return JSON with:
-headline, summary, harmless[], needs_escalation[], open_questions[].
+Produce the morning investigation. You may merge or split candidates, but every input event ID
+must appear in at least one finding. Do not copy risk score into confidence; the backend derives
+confidence from evidence quality.
+
+Return:
+{{
+  "headline": "short decision headline",
+  "summary": "what happened, what is harmless, and what remains uncertain",
+  "open_questions": ["question requiring verification"],
+  "findings": [
+    {{
+      "title": "finding title",
+      "classification": "CLEARED|NEEDS_REVIEW|ESCALATE",
+      "summary": "evidence-based finding",
+      "uncertainty": "what cannot be verified",
+      "recommended_action": "specific next action or no action required",
+      "evidence_event_ids": ["existing event id"],
+      "supports_escalation": ["specific evidence"],
+      "supports_false_alarm": ["specific evidence"]
+    }}
+  ]
+}}
 """
-    return await _gemini_json(prompt)
+    finding_timeout = float(os.getenv("GEMINI_FINDING_TIMEOUT_SECONDS", "90"))
+    return await _gemini_json(
+        prompt,
+        "finding generation",
+        timeout=finding_timeout,
+    )
+
+
+def _dynamic_coverage_gap(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    candidates_with_gap = [
+        candidate for candidate in candidates if candidate.get("coverage_gap")
+    ]
+    if not candidates_with_gap:
+        return {
+            "location_id": "",
+            "start": "",
+            "end": "",
+            "minutes": 0,
+            "label": "No unresolved drone coverage gap",
+        }
+    candidate = max(
+        candidates_with_gap,
+        key=lambda item: (item["risk"]["score"], item["coverage_gap"]["minutes"]),
+    )
+    return candidate["coverage_gap"]
+
+
+def _drone_checked_locations(
+    drone_context: dict[str, Any],
+    site_context: dict[str, Any],
+) -> list[str]:
+    names = {
+        location["id"]: location["name"]
+        for location in site_context.get("locations", [])
+    }
+    checked: list[str] = []
+    for patrol in drone_context.get("patrols", []):
+        for location_id in patrol["route"]:
+            if location_id != "control-room" and location_id in names:
+                checked.append(names[location_id])
+    return list(dict.fromkeys(checked))
 
 
 async def build_investigation(
@@ -223,12 +641,12 @@ async def build_investigation(
     status: str = "draft",
     finding_reviews: list[dict[str, Any]] | None = None,
 ) -> Investigation:
-    steps, investigation = None, None
+    investigation: Investigation | None = None
     async for event in run_investigation_stream(review_note, status, finding_reviews):
         if event["type"] == "complete":
             investigation = Investigation(**event["data"])
     if investigation is None:
-        raise RuntimeError("Investigation did not complete")
+        raise AgentUnavailable("The investigation did not produce a result.")
     return investigation
 
 
@@ -239,156 +657,151 @@ async def run_investigation_stream(
 ) -> AsyncGenerator[dict[str, Any], None]:
     reasoning_steps: list[ReasoningStep] = []
     tool_calls: list[ToolCall] = []
-    context: dict[str, Any] = {}
-    review_map = {item.get("finding_id"): item for item in (finding_reviews or [])}
+    review_map = {
+        item.get("finding_id"): item for item in (finding_reviews or [])
+    }
 
-    yield {"type": "thought", "data": {"text": "Creating a guarded Planner + ReAct investigation plan."}}
-    await asyncio.sleep(0.08)
-    plan = await _plan_with_gemini(review_note)
+    search_thought = "Searching every overnight signal before deciding which context tools are needed."
+    reasoning_steps.append(ReasoningStep(kind="thought", text=search_thought))
+    yield {"type": "thought", "data": {"text": search_thought}}
+    search_call = _tool(
+        "search_events",
+        {
+            "severities": ["info", "warning", "critical"],
+            "since": "00:00",
+            "until": "06:10",
+        },
+        "Discover the complete overnight evidence set.",
+    )
+    tool_calls.append(search_call)
+    reasoning_steps.append(
+        ReasoningStep(kind="tool", text="Called search_events.", tool_call=search_call)
+    )
+    yield {"type": "tool", "data": search_call.model_dump()}
+    search_observation = _summarize_observation(search_call)
+    reasoning_steps.append(
+        ReasoningStep(kind="observation", text=search_observation)
+    )
+    yield {"type": "observation", "data": {"text": search_observation}}
+
+    events = search_call.result["events"]
+    plan = await _plan_with_gemini(events, review_note)
+    context: dict[str, Any] = {"events": events}
 
     for step in plan:
         thought = step["thought"]
         reasoning_steps.append(ReasoningStep(kind="thought", text=thought))
         yield {"type": "thought", "data": {"text": thought}}
-        await asyncio.sleep(0.08)
-
         name = step["tool"]
-        args = step.get("arguments") or {}
+        arguments = step["arguments"]
         if name == "calculate_risk":
-            args = _prepare_calculate_args(args, context)
-
-        tool_call = _tool(name, args, step["rationale"])
+            arguments = _prepare_calculate_args(arguments, context)
+        tool_call = _tool(name, arguments, step["rationale"])
         tool_calls.append(tool_call)
-        reasoning_steps.append(ReasoningStep(kind="tool", text=f"Called {name}.", tool_call=tool_call))
+        reasoning_steps.append(
+            ReasoningStep(kind="tool", text=f"Called {name}.", tool_call=tool_call)
+        )
         yield {"type": "tool", "data": tool_call.model_dump()}
-        await asyncio.sleep(0.08)
-
-        if name == "search_events":
-            context["important_events"] = tool_call.result["events"]
-        elif name == "get_site_context":
+        if name == "get_site_context":
             context["site_context"] = tool_call.result
-        elif name == "get_drone_patrols":
-            context["drone_context"] = tool_call.result
         elif name == "get_badge_history":
             context["badge_context"] = tool_call.result
+        elif name == "get_drone_patrols":
+            context["drone_context"] = tool_call.result
         elif name == "calculate_risk":
             context["risk"] = tool_call.result
-        elif name == "plan_follow_up_mission":
-            context["follow_up"] = tool_call.result
-
         observation = _summarize_observation(tool_call)
         reasoning_steps.append(ReasoningStep(kind="observation", text=observation))
         yield {"type": "observation", "data": {"text": observation}}
-        await asyncio.sleep(0.08)
 
-    important_events = context.get("important_events", [])
     site_context = context.get("site_context", {"locations": [], "zones": []})
+    observed_locations = {event["location_id"] for event in events}
+    loaded_locations = {
+        location["id"] for location in site_context.get("locations", [])
+    }
+    if not observed_locations <= loaded_locations:
+        raise AgentOutputError(
+            "Gemini did not request spatial context for every observed location."
+        )
     drone_context = context.get("drone_context", {"patrols": []})
-    risk = context.get("risk", {"confidence": 78, "escalation_level": "review"})
     badge_context = context.get("badge_context", {"badge_histories": []})
-    follow_up = context.get("follow_up") or call_tool(
+    candidates = build_incident_candidates(
+        events,
+        site_context,
+        drone_context,
+        badge_context,
+    )
+
+    synthesis_thought = (
+        f"Correlated {len(events)} events into {len(candidates)} evidence-driven "
+        "candidate(s); asking Gemini to classify only cited evidence."
+    )
+    reasoning_steps.append(ReasoningStep(kind="thought", text=synthesis_thought))
+    yield {"type": "thought", "data": {"text": synthesis_thought}}
+    raw = await _generate_investigation_with_gemini(candidates, events, review_note)
+    findings, headline, summary, open_questions = validate_generated_investigation(
+        raw,
+        events,
+        candidates,
+        review_map,
+    )
+
+    unresolved_locations = list(
+        dict.fromkeys(
+            location_id
+            for finding in findings
+            if finding.classification != "CLEARED"
+            for location_id in finding.location_ids
+        )
+    )
+    mission_call = _tool(
         "plan_follow_up_mission",
-        {"focus_locations": ["storage-c", "access-a", "gate-3"]},
+        {"focus_locations": unresolved_locations},
+        "Build a route only from locations in unresolved generated findings.",
     )
-
-    vehicle_time = _minutes("01:22")
-    drone_time = _minutes(drone_context["patrols"][0]["started_at"]) if drone_context["patrols"] else _minutes("02:03")
-    coverage_gap = {
-        "location_id": "storage-c",
-        "start": "01:22",
-        "end": drone_context["patrols"][0]["started_at"] if drone_context["patrols"] else "02:03",
-        "minutes": max(0, drone_time - vehicle_time),
-        "label": "Unverified window before drone arrival",
-    }
-
-    findings = [
-        Finding(
-            id="f-access-cluster",
-            title="Storage Yard C access sequence needs escalation",
-            classification="ESCALATE",
-            severity="critical",
-            confidence=84,
-            review_status=review_map.get("f-access-cluster", {}).get("status", "pending"),
-            summary="Vehicle movement near Storage Yard C deviated from the known contractor route and was followed within minutes by three failed badge swipes at Access Point A.",
-            evidence_event_ids=["evt-003", "evt-004", "evt-005", "evt-006"],
-            location_ids=["storage-c", "access-a", "block-c"],
-            uncertainty="I cannot confirm whether this was a contractor shortcut or an unknown individual until vehicle authorization and badge identity are checked.",
-            supports_escalation=["Restricted yard", "repeated access failures", "Raghav asked Maya to check Block C"],
-            supports_false_alarm=["No person detected by later drone pass"],
-        ),
-        Finding(
-            id="f-gate-3",
-            title="Gate 3 fence alert is plausible noise but not fully cleared",
-            classification="NEEDS_REVIEW",
-            severity="warning",
-            confidence=61,
-            review_status=review_map.get("f-gate-3", {}).get("status", "pending"),
-            summary="Adjacent Gate 3 sensors and 34 km/h wind make this consistent with wind noise, but it happened seven minutes before the Storage Yard C vehicle signal.",
-            evidence_event_ids=["evt-001", "evt-002"],
-            location_ids=["gate-3"],
-            uncertainty="There was no visual confirmation exactly at 01:15.",
-            supports_escalation=["Alert occurred seven minutes before vehicle detection"],
-            supports_false_alarm=["Weather station recorded wind gusts near the same perimeter"],
-        ),
-        Finding(
-            id="f-cleared-noise",
-            title="Warehouse and South Yard signals look harmless",
-            classification="CLEARED",
-            severity="info",
-            confidence=92,
-            review_status=review_map.get("f-cleared-noise", {}).get("status", "pending"),
-            summary="Warehouse 2 and South Yard activity match expected cleaning and contractor patterns.",
-            evidence_event_ids=["evt-009", "evt-010"],
-            location_ids=["warehouse-2", "south-yard"],
-            uncertainty="Low. These do not spatially or temporally connect to Block C.",
-            supports_escalation=[],
-            supports_false_alarm=["Cleaning window matched", "contractor check-in matched expected staging"],
-        ),
-    ]
-
-    base = {
-        "important_events": important_events,
-        "drone": drone_context,
-        "badge": badge_context,
-        "risk": risk,
-        "coverage_gap": coverage_gap,
-        "findings": [finding.model_dump() for finding in findings],
-    }
-    ai_synthesis = await _synthesize_with_gemini(base, review_note)
-
-    headline = "Escalate Storage Yard C, clear routine noise"
-    summary = (
-        "The agent found a meaningful cluster around Storage Yard C: a vehicle path, repeated badge failures, "
-        "and a later drone pass with medium coverage. I cannot confirm whether this was a contractor or intruder yet. "
-        "Warehouse 2 and South Yard look like false alarms because they match expected activity."
+    tool_calls.append(mission_call)
+    reasoning_steps.append(
+        ReasoningStep(
+            kind="tool",
+            text="Called plan_follow_up_mission.",
+            tool_call=mission_call,
+        )
     )
+    yield {"type": "tool", "data": mission_call.model_dump()}
+    mission_observation = (
+        f"Generated a follow-up route for {len(unresolved_locations)} unresolved "
+        "location(s)."
+    )
+    reasoning_steps.append(
+        ReasoningStep(kind="observation", text=mission_observation)
+    )
+    yield {"type": "observation", "data": {"text": mission_observation}}
+
     harmless = [
-        "Warehouse 2 service door activity matches the cleaning window.",
-        "South Yard contractor check-in matches expected staging.",
-        "Gate 3 has weather context, but remains tied to the open question.",
+        finding.summary
+        for finding in findings
+        if finding.classification == "CLEARED"
     ]
     needs_escalation = [
-        "Confirm vehicle authorization for Storage Yard C.",
-        "Identify the failed badge attempts at Access Point A.",
-        "Run the follow-up drone sweep over the unverified window area.",
+        finding.recommended_action
+        for finding in findings
+        if finding.classification in {"NEEDS_REVIEW", "ESCALATE"}
     ]
-    open_questions = [
-        "Was the vehicle authorized for Storage Yard C?",
-        "Who attempted the three failed badge swipes?",
-        f"What happened during the {coverage_gap['minutes']}-minute gap before the drone arrived?",
-    ]
-
-    if ai_synthesis:
-        headline = ai_synthesis.get("headline") or headline
-        summary = ai_synthesis.get("summary") or summary
-        harmless = ai_synthesis.get("harmless") or harmless
-        needs_escalation = ai_synthesis.get("needs_escalation") or needs_escalation
-        open_questions = ai_synthesis.get("open_questions") or open_questions
-
-    if review_note:
-        summary = f"{summary} Maya context: {review_note}"
-
-    final_step = "Synthesized escalation, false alarms, uncertainty, and a follow-up drone route."
+    if any(finding.classification == "ESCALATE" for finding in findings):
+        escalation_level = "escalate"
+    elif any(finding.classification == "NEEDS_REVIEW" for finding in findings):
+        escalation_level = "review"
+    else:
+        escalation_level = "monitor"
+    confidence = (
+        round(sum(finding.confidence for finding in findings) / len(findings))
+        if findings
+        else 0
+    )
+    final_step = (
+        "Validated every generated finding against current event IDs and built "
+        "the briefing from those findings."
+    )
     reasoning_steps.append(ReasoningStep(kind="summary", text=final_step))
     yield {"type": "summary", "data": {"text": final_step}}
 
@@ -396,18 +809,18 @@ async def run_investigation_stream(
         status=status,  # type: ignore[arg-type]
         generated_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
         headline=headline,
-        confidence=risk["confidence"],
-        escalation_level=risk["escalation_level"],
+        confidence=confidence,
+        escalation_level=escalation_level,
         summary=summary,
         harmless=harmless,
         needs_escalation=needs_escalation,
-        drone_checked=["Block C corridor", "Storage Yard C perimeter", "Gate 3 fence line"],
+        drone_checked=_drone_checked_locations(drone_context, site_context),
         open_questions=open_questions,
         findings=findings,
-        follow_up_mission=FollowUpMission(**follow_up),
+        follow_up_mission=FollowUpMission(**mission_call.result),
         tool_calls=tool_calls,
         reasoning_steps=reasoning_steps,
-        coverage_gap=coverage_gap,
+        coverage_gap=_dynamic_coverage_gap(candidates),
         review_note=review_note,
     )
     yield {"type": "complete", "data": investigation.model_dump()}

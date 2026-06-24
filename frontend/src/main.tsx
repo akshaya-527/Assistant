@@ -82,6 +82,7 @@ type Finding = {
   evidence_event_ids: string[];
   location_ids: string[];
   uncertainty: string;
+  recommended_action: string;
   supports_escalation: string[];
   supports_false_alarm: string[];
 };
@@ -133,9 +134,13 @@ type StreamEvent =
   | { type: "observation"; data: { text: string } }
   | { type: "summary"; data: { text: string } }
   | { type: "tool"; data: ToolCall }
+  | { type: "error"; data: { message: string; retryable: boolean } }
   | { type: "complete"; data: Investigation };
 
-const API = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+const API = (import.meta.env.VITE_API_URL ?? "http://localhost:8000").replace(
+  /\/+$/,
+  "",
+);
 
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API}${path}`);
@@ -149,7 +154,10 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!response.ok) throw new Error(`Request failed: ${path}`);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail ?? `Request failed: ${path}`);
+  }
   return response.json();
 }
 
@@ -301,18 +309,6 @@ function App() {
     if (finding) focusFinding(finding.id, scrollIntoView);
   };
 
-  const replayInvestigation = async () => {
-    const result = await postJson<Investigation>("/api/investigate", {
-      review_note: reviewNote,
-    });
-    setInvestigation(result);
-    setStreamSteps([]);
-    for (const step of result.reasoning_steps) {
-      setStreamSteps((steps) => [...steps, step]);
-      await new Promise((resolve) => window.setTimeout(resolve, 220));
-    }
-  };
-
   const runStream = async () => {
     setLoading(true);
     setError(null);
@@ -332,6 +328,8 @@ function App() {
             ]);
           } else if (event.type === "complete") {
             setInvestigation(event.data);
+          } else if (event.type === "error") {
+            setError(event.data.message);
           } else {
             setStreamSteps((steps) => [
               ...steps,
@@ -341,17 +339,11 @@ function App() {
         },
       );
     } catch (err) {
-      try {
-        await replayInvestigation();
-      } catch (fallbackErr) {
-        setError(
-          fallbackErr instanceof Error
-            ? fallbackErr.message
-            : err instanceof Error
-              ? err.message
-              : "Investigation failed",
-        );
-      }
+      setError(
+        err instanceof Error
+          ? err.message
+          : "The AI investigation failed. Retry when Gemini is available.",
+      );
     } finally {
       setLoading(false);
     }
@@ -943,7 +935,7 @@ function ReviewPanel({
                   <span>
                     {finding.classification === "CLEARED"
                       ? "No physical check required unless new evidence appears."
-                      : finding.supports_escalation[0] ?? "Validate the remaining evidence gap."}
+                      : finding.recommended_action}
                   </span>
                 </div>
               </div>
